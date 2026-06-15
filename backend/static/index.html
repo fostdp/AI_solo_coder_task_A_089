@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>古代栈道结构力学仿真与风化评估系统</title>
+    <link rel="stylesheet" href="css/styles.css">
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="app">
+        <header class="app-header">
+            <div class="header-left">
+                <h1>🏔️ 古代栈道结构力学仿真与风化评估系统</h1>
+                <span class="subtitle">Ancient Plank Road Structural Mechanics & Weathering Assessment</span>
+            </div>
+            <div class="header-right">
+                <div class="connection-status" id="connStatus">
+                    <span class="status-dot"></span>
+                    <span>连接中...</span>
+                </div>
+                <div class="clock" id="clock">--:--:--</div>
+            </div>
+        </header>
+
+        <div class="main-layout">
+            <aside class="sidebar">
+                <div class="panel">
+                    <h3>📍 秦巴山区栈道遗址</h3>
+                    <div class="site-list" id="siteList">
+                        <div class="loading">加载遗址列表...</div>
+                    </div>
+                </div>
+
+                <div class="panel" id="siteInfoPanel" style="display:none;">
+                    <h3>📋 遗址详情</h3>
+                    <div class="info-grid" id="siteInfo"></div>
+                </div>
+
+                <div class="panel" id="weatheringPanel" style="display:none;">
+                    <h3>🌡️ 风化评估</h3>
+                    <div id="weatheringInfo" class="weathering-box"></div>
+                </div>
+
+                <div class="panel">
+                    <h3>🔧 显示控制</h3>
+                    <div class="control-group">
+                        <label class="switch">
+                            <input type="checkbox" id="showStress" checked>
+                            <span>受力颜色标注</span>
+                        </label>
+                        <label class="switch">
+                            <input type="checkbox" id="showCracks" checked>
+                            <span>显示岩体裂隙</span>
+                        </label>
+                        <label class="switch">
+                            <input type="checkbox" id="showSensors" checked>
+                            <span>显示传感器点位</span>
+                        </label>
+                        <label class="switch">
+                            <input type="checkbox" id="showWireframe">
+                            <span>网格线框模式</span>
+                        </label>
+                    </div>
+                    <div class="control-group">
+                        <label>应力显示范围 (MPa)</label>
+                        <div class="range-row">
+                            <input type="range" id="stressMin" min="0" max="20" step="0.5" value="0">
+                            <span id="stressMinVal">0</span>
+                        </div>
+                        <div class="range-row">
+                            <input type="range" id="stressMax" min="5" max="50" step="0.5" value="25">
+                            <span id="stressMaxVal">25</span>
+                        </div>
+                    </div>
+                    <div class="control-group">
+                        <label>渲染模式</label>
+                        <select id="renderMode">
+                            <option value="stress">按应力着色</option>
+                            <option value="material">按材料显示</option>
+                            <option value="weathering">按风化等级</option>
+                        </select>
+                    </div>
+                </div>
+            </aside>
+
+            <main class="main-content">
+                <div class="canvas-container" id="canvasContainer">
+                    <canvas id="threeCanvas"></canvas>
+                    <div class="canvas-overlay">
+                        <div class="color-legend" id="colorLegend">
+                            <div class="legend-title">应力云图 (MPa)</div>
+                            <div class="legend-bar">
+                                <div class="gradient-bar"></div>
+                                <div class="legend-labels">
+                                    <span>0</span><span>5</span><span>10</span><span>15</span><span>20</span><span>25+</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="stats-panel" id="statsPanel">
+                            <div class="stat-item">
+                                <span class="stat-label">木梁最大应力</span>
+                                <span class="stat-value" id="maxWoodStress">-- MPa</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">岩体最大应力</span>
+                                <span class="stat-value" id="maxRockStress">-- MPa</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">最大挠度</span>
+                                <span class="stat-value" id="maxDeflection">-- mm</span>
+                            </div>
+                            <div class="stat-item">
+                                <span class="stat-label">安全系数</span>
+                                <span class="stat-value" id="safetyFactor">--</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="bottom-panels">
+                    <div class="panel data-panel">
+                        <div class="panel-header">
+                            <h3>📊 实时监测数据</h3>
+                            <div class="panel-actions">
+                                <button class="btn btn-sm" id="btnRefreshData">刷新</button>
+                                <button class="btn btn-sm btn-primary" id="btnSimulate">运行仿真</button>
+                                <button class="btn btn-sm btn-warn" id="btnWeathering">风化评估</button>
+                            </div>
+                        </div>
+                        <div class="chart-tabs">
+                            <button class="tab-btn active" data-tab="strain">梁孔应变</button>
+                            <button class="tab-btn" data-tab="crack">岩体裂隙</button>
+                            <button class="tab-btn" data-tab="env">温湿度</button>
+                        </div>
+                        <div class="chart-container" id="chartContainer">
+                            <canvas id="chartCanvas"></canvas>
+                        </div>
+                    </div>
+
+                    <div class="panel alarm-panel">
+                        <h3>🚨 告警事件</h3>
+                        <div class="alarm-list" id="alarmList">
+                            <div class="no-alarm">暂无告警</div>
+                        </div>
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <div id="loadingOverlay" class="loading-overlay">
+        <div class="loader"></div>
+        <p>系统加载中...</p>
+    </div>
+
+    <div id="toastContainer" class="toast-container"></div>
+
+    <script type="module" src="js/app.js"></script>
+</body>
+</html>
