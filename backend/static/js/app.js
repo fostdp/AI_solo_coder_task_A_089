@@ -28,6 +28,7 @@ const state = {
     rockMaterial: null,
     sensorMarkers: [],
     crackMeshes: [],
+    textureCache: {},
 };
 
 const rockTextures = {
@@ -240,8 +241,8 @@ function buildPlankRoad(site) {
     const beamSpacing = totalLength / beamCount;
     const mountainHeight = 15;
 
-    buildRockMountain(rockCfg, totalLength, mountainHeight);
-    buildBeamsAndPlanks(woodCfg, beamCount, beamSpacing);
+    buildRockMountain(rockCfg, totalLength, mountainHeight, rockType);
+    buildBeamsAndPlanks(woodCfg, beamCount, beamSpacing, woodType);
     buildBeamHoles(rockCfg, beamCount, beamSpacing, mountainHeight);
 
     if (state.showCracks) {
@@ -271,7 +272,7 @@ function clearGroup(group) {
     }
 }
 
-function buildRockMountain(cfg, length, height) {
+function buildRockMountain(cfg, length, height, rockType) {
     const cliffGeo = new THREE.BoxGeometry(length + 20, height, 20);
     const positions = cliffGeo.attributes.position;
     for (let i = 0; i < positions.count; i++) {
@@ -283,26 +284,18 @@ function buildRockMountain(cfg, length, height) {
     }
     cliffGeo.computeVertexNormals();
 
-    const canvas = document.createElement('canvas');
-    canvas.width = 1024;
-    canvas.height = 1024;
-    const ctx = canvas.getContext('2d');
-    generateRockTexture(ctx, cfg, 1024);
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
-    texture.repeat.set(4, 3);
-
-    state.rockMaterial = new THREE.MeshStandardMaterial({
-        map: texture,
-        roughness: cfg.rough,
-        metalness: 0.05,
-    });
+    state.rockMaterial = createProgressiveRockMaterial(cfg, rockType);
 
     const cliff = new THREE.Mesh(cliffGeo, state.rockMaterial);
     cliff.position.set(0, height / 2 - 2, -10);
     cliff.castShadow = true;
     cliff.receiveShadow = true;
+    cliff.userData.needsUpgrade = true;
+    cliff.userData.rockType = rockType;
+    cliff.userData.cfg = cfg;
     state.plankRoadGroup.add(cliff);
+
+    upgradeRockMaterial(cliff, cfg, rockType, 2048);
 
     for (let i = 0; i < 30; i++) {
         const rockSize = 0.5 + Math.random() * 2.5;
@@ -328,6 +321,279 @@ function buildRockMountain(cfg, length, height) {
         rock.userData.isRock = true;
         state.plankRoadGroup.add(rock);
     }
+}
+
+function createProgressiveRockMaterial(cfg, rockType) {
+    const cacheKey = `${rockType}_low`;
+    let lowTex;
+    if (state.textureCache[cacheKey]) {
+        lowTex = state.textureCache[cacheKey];
+    } else {
+        const canvas = document.createElement('canvas');
+        canvas.width = 512;
+        canvas.height = 512;
+        const ctx = canvas.getContext('2d');
+        generateRockTexture(ctx, cfg, 512);
+        lowTex = new THREE.CanvasTexture(canvas);
+        lowTex.wrapS = lowTex.wrapT = THREE.RepeatWrapping;
+        lowTex.repeat.set(4, 3);
+        lowTex.needsUpdate = true;
+        state.textureCache[cacheKey] = lowTex;
+    }
+
+    return new THREE.MeshStandardMaterial({
+        map: lowTex,
+        roughness: cfg.rough,
+        metalness: 0.05,
+        normalScale: new THREE.Vector2(0, 0),
+    });
+}
+
+function upgradeRockMaterial(mesh, cfg, rockType, targetSize) {
+    const cacheKey = `${rockType}_${targetSize}`;
+
+    const applyPBR = (maps) => {
+        const mat = mesh.material;
+        if (!mat) return;
+        if (maps.baseColor) {
+            if (mat.map) mat.map.dispose();
+            mat.map = maps.baseColor;
+        }
+        if (maps.normalMap) {
+            mat.normalMap = maps.normalMap;
+            mat.normalScale = new THREE.Vector2(0.8, 0.8);
+        }
+        if (maps.roughnessMap) {
+            mat.roughnessMap = maps.roughnessMap;
+        }
+        if (maps.aoMap) {
+            mat.aoMap = maps.aoMap;
+            mat.aoMapIntensity = 0.6;
+        }
+        mat.needsUpdate = true;
+    };
+
+    if (state.textureCache[cacheKey + '_pbr']) {
+        applyPBR(state.textureCache[cacheKey + '_pbr']);
+        return;
+    }
+
+    setTimeout(() => {
+        const maps = generatePBRTextures(cfg, targetSize);
+        state.textureCache[cacheKey + '_pbr'] = maps;
+        applyPBR(maps);
+    }, 30);
+}
+
+function generatePBRTextures(cfg, size) {
+    const baseCanvas = document.createElement('canvas');
+    baseCanvas.width = size;
+    baseCanvas.height = size;
+    const baseCtx = baseCanvas.getContext('2d');
+    generateRockTexture(baseCtx, cfg, size);
+
+    const heightData = baseCtx.getImageData(0, 0, size, size).data;
+
+    const normalCanvas = document.createElement('canvas');
+    normalCanvas.width = size;
+    normalCanvas.height = size;
+    const normalCtx = normalCanvas.getContext('2d');
+    generateNormalMap(normalCtx, heightData, size, 4.0);
+
+    const roughCanvas = document.createElement('canvas');
+    roughCanvas.width = size;
+    roughCanvas.height = size;
+    const roughCtx = roughCanvas.getContext('2d');
+    generateRoughnessMap(roughCtx, heightData, size, cfg.rough);
+
+    const aoCanvas = document.createElement('canvas');
+    aoCanvas.width = size;
+    aoCanvas.height = size;
+    const aoCtx = aoCanvas.getContext('2d');
+    generateAOMap(aoCtx, heightData, size);
+
+    const baseColor = new THREE.CanvasTexture(baseCanvas);
+    baseColor.wrapS = baseColor.wrapT = THREE.RepeatWrapping;
+    baseColor.repeat.set(4, 3);
+    baseColor.colorSpace = THREE.SRGBColorSpace;
+    baseColor.anisotropy = 8;
+    baseColor.needsUpdate = true;
+
+    const normalMap = new THREE.CanvasTexture(normalCanvas);
+    normalMap.wrapS = normalMap.wrapT = THREE.RepeatWrapping;
+    normalMap.repeat.set(4, 3);
+    normalMap.anisotropy = 8;
+    normalMap.needsUpdate = true;
+
+    const roughnessMap = new THREE.CanvasTexture(roughCanvas);
+    roughnessMap.wrapS = roughnessMap.wrapT = THREE.RepeatWrapping;
+    roughnessMap.repeat.set(4, 3);
+    roughnessMap.needsUpdate = true;
+
+    const aoMap = new THREE.CanvasTexture(aoCanvas);
+    aoMap.wrapS = aoMap.wrapT = THREE.RepeatWrapping;
+    aoMap.repeat.set(4, 3);
+    aoMap.needsUpdate = true;
+
+    return { baseColor, normalMap, roughnessMap, aoMap };
+}
+
+function generateNormalMap(ctx, heightData, size, strength) {
+    const imgData = ctx.createImageData(size, size);
+    const dst = imgData.data;
+    const getPix = (yy, xx) => {
+        const ii = (yy * size + xx) * 4;
+        return (heightData[ii] + heightData[ii+1] + heightData[ii+2]) / 3;
+    };
+
+    for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+            const xl = (x - 1 + size) % size;
+            const xr = (x + 1) % size;
+            const yu = (y - 1 + size) % size;
+            const yd = (y + 1) % size;
+
+            const hl = getPix(y, xl);
+            const hr = getPix(y, xr);
+            const hu = getPix(yu, x);
+            const hd = getPix(yd, x);
+
+            let dx = (hl - hr) / 255 * strength;
+            let dy = (hu - hd) / 255 * strength;
+            const dz = 1.0;
+
+            const len = Math.sqrt(dx*dx + dy*dy + dz*dz);
+            dx /= len; dy /= len; const dzN = dz / len;
+
+            const di = (y * size + x) * 4;
+            dst[di]     = Math.floor((dx * 0.5 + 0.5) * 255);
+            dst[di + 1] = Math.floor((dy * 0.5 + 0.5) * 255);
+            dst[di + 2] = Math.floor((dzN * 0.5 + 0.5) * 255);
+            dst[di + 3] = 255;
+        }
+    }
+    ctx.putImageData(imgData, 0, 0);
+}
+
+function generateRoughnessMap(ctx, heightData, size, baseRough) {
+    const imgData = ctx.createImageData(size, size);
+    const dst = imgData.data;
+
+    for (let y = 0; y < size; y += 4) {
+        for (let x = 0; x < size; x += 4) {
+            let sum = 0, minV = 255, maxV = 0;
+            for (let dy = 0; dy < 4; dy++) {
+                for (let dx = 0; dx < 4; dx++) {
+                    const idx = ((y + dy) * size + (x + dx)) * 4;
+                    const l = (heightData[idx] + heightData[idx+1] + heightData[idx+2]) / 3;
+                    sum += l;
+                    if (l < minV) minV = l;
+                    if (l > maxV) maxV = l;
+                }
+            }
+            const variance = (maxV - minV) / 255;
+            const v = Math.min(1.0, baseRough * 0.7 + variance * 0.8);
+            const gray = Math.floor(v * 255);
+
+            for (let dy = 0; dy < 4; dy++) {
+                for (let dx = 0; dx < 4; dx++) {
+                    const di = ((y + dy) * size + (x + dx)) * 4;
+                    dst[di] = gray; dst[di+1] = gray; dst[di+2] = gray; dst[di+3] = 255;
+                }
+            }
+        }
+    }
+    ctx.putImageData(imgData, 0, 0);
+}
+
+function generateAOMap(ctx, heightData, size) {
+    const imgData = ctx.createImageData(size, size);
+    const dst = imgData.data;
+    const tmp = new Float32Array(size * size);
+
+    const block = 8;
+    for (let y = 0; y < size; y += block) {
+        for (let x = 0; x < size; x += block) {
+            let sum = 0;
+            for (let dy = 0; dy < block; dy++) {
+                for (let dx = 0; dx < block; dx++) {
+                    const idx = ((y + dy) * size + (x + dx)) * 4;
+                    sum += (heightData[idx] + heightData[idx+1] + heightData[idx+2]) / 3;
+                }
+            }
+            const avg = sum / (block * block);
+            for (let dy = 0; dy < block; dy++) {
+                for (let dx = 0; dx < block; dx++) {
+                    tmp[(y + dy) * size + (x + dx)] = avg;
+                }
+            }
+        }
+    }
+
+    const block2 = 32;
+    for (let y = 0; y < size; y++) {
+        for (let x = 0; x < size; x++) {
+            let local = tmp[y * size + x];
+            let surround = 0, cnt = 0;
+            for (let dy = -block2; dy <= block2; dy += block) {
+                for (let dx = -block2; dx <= block2; dx += block) {
+                    const yy = Math.min(size-1, Math.max(0, y + dy));
+                    const xx = Math.min(size-1, Math.max(0, x + dx));
+                    surround += tmp[yy * size + xx];
+                    cnt++;
+                }
+            }
+            surround /= cnt;
+
+            let ao = 1.0;
+            if (local < surround - 5) {
+                ao = 0.5 + (local - (surround - 20)) / 30;
+            }
+            ao = Math.max(0.3, Math.min(1.0, ao));
+            const gray = Math.floor(ao * 255);
+            const di = (y * size + x) * 4;
+            dst[di] = gray; dst[di+1] = gray; dst[di+2] = gray; dst[di+3] = 255;
+        }
+    }
+    ctx.putImageData(imgData, 0, 0);
+}
+
+function generateWoodPBR(cfg, size) {
+    const baseCanvas = document.createElement('canvas');
+    baseCanvas.width = size;
+    baseCanvas.height = size;
+    const baseCtx = baseCanvas.getContext('2d');
+    generateWoodTexture(baseCtx, cfg, size);
+
+    const heightData = baseCtx.getImageData(0, 0, size, size).data;
+
+    const normalCanvas = document.createElement('canvas');
+    normalCanvas.width = size;
+    normalCanvas.height = size;
+    generateNormalMap(normalCanvas.getContext('2d'), heightData, size, 2.0);
+
+    const roughCanvas = document.createElement('canvas');
+    roughCanvas.width = size;
+    roughCanvas.height = size;
+    generateRoughnessMap(roughCanvas.getContext('2d'), heightData, size, cfg.rough);
+
+    const baseColor = new THREE.CanvasTexture(baseCanvas);
+    baseColor.wrapS = baseColor.wrapT = THREE.RepeatWrapping;
+    baseColor.repeat.set(1, 2);
+    baseColor.colorSpace = THREE.SRGBColorSpace;
+    baseColor.needsUpdate = true;
+
+    const normalMap = new THREE.CanvasTexture(normalCanvas);
+    normalMap.wrapS = normalMap.wrapT = THREE.RepeatWrapping;
+    normalMap.repeat.set(1, 2);
+    normalMap.needsUpdate = true;
+
+    const roughnessMap = new THREE.CanvasTexture(roughCanvas);
+    roughnessMap.wrapS = roughnessMap.wrapT = THREE.RepeatWrapping;
+    roughnessMap.repeat.set(1, 2);
+    roughnessMap.needsUpdate = true;
+
+    return { baseColor, normalMap, roughnessMap };
 }
 
 function generateRockTexture(ctx, cfg, size) {
@@ -387,21 +653,56 @@ function generateRockTexture(ctx, cfg, size) {
     }
 }
 
-function buildBeamsAndPlanks(woodCfg, beamCount, beamSpacing) {
-    const canvas = document.createElement('canvas');
-    canvas.width = 512;
-    canvas.height = 512;
-    const ctx = canvas.getContext('2d');
-    generateWoodTexture(ctx, woodCfg, 512);
-    const woodTex = new THREE.CanvasTexture(canvas);
-    woodTex.wrapS = woodTex.wrapT = THREE.RepeatWrapping;
-    woodTex.repeat.set(1, 2);
+function buildBeamsAndPlanks(woodCfg, beamCount, beamSpacing, woodType) {
+    const lowKey = `${woodType}_wood_low`;
+    let woodTex;
+    if (state.textureCache[lowKey]) {
+        woodTex = state.textureCache[lowKey];
+    } else {
+        const canvas = document.createElement('canvas');
+        canvas.width = 256;
+        canvas.height = 256;
+        const ctx = canvas.getContext('2d');
+        generateWoodTexture(ctx, woodCfg, 256);
+        woodTex = new THREE.CanvasTexture(canvas);
+        woodTex.wrapS = woodTex.wrapT = THREE.RepeatWrapping;
+        woodTex.repeat.set(1, 2);
+        woodTex.colorSpace = THREE.SRGBColorSpace;
+        woodTex.needsUpdate = true;
+        state.textureCache[lowKey] = woodTex;
+    }
 
     state.woodMaterial = new THREE.MeshStandardMaterial({
         map: woodTex,
         roughness: woodCfg.rough,
         metalness: 0.02,
     });
+
+    setTimeout(() => {
+        const hiKey = `${woodType}_wood_1024_pbr`;
+        let maps;
+        if (state.textureCache[hiKey]) {
+            maps = state.textureCache[hiKey];
+        } else {
+            maps = generateWoodPBR(woodCfg, 1024);
+            state.textureCache[hiKey] = maps;
+        }
+        state.woodMaterial.map = maps.baseColor;
+        state.woodMaterial.normalMap = maps.normalMap;
+        state.woodMaterial.normalScale = new THREE.Vector2(0.4, 0.4);
+        state.woodMaterial.roughnessMap = maps.roughnessMap;
+        state.woodMaterial.needsUpdate = true;
+
+        state.plankRoadGroup.traverse((obj) => {
+            if (obj.isMesh && obj.userData.isWood && obj.material) {
+                obj.material.map = maps.baseColor;
+                obj.material.normalMap = maps.normalMap;
+                obj.material.normalScale = new THREE.Vector2(0.4, 0.4);
+                obj.material.roughnessMap = maps.roughnessMap;
+                obj.material.needsUpdate = true;
+            }
+        });
+    }, 60);
 
     for (let i = 0; i < beamCount; i++) {
         const x = -beamSpacing * beamCount / 2 + i * beamSpacing;
