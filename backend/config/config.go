@@ -9,12 +9,13 @@ import (
 )
 
 type Config struct {
-	Server   ServerConfig
-	Database DatabaseConfig
-	MQTT     MQTTConfig
-	Alarm    AlarmConfig
-	FEM      FEMConfig
-	Weather  WeatherConfig
+	Server     ServerConfig
+	Database   DatabaseConfig
+	MQTT       MQTTConfig
+	FEM        FEMConfig
+	Weather    WeatherConfig
+	Alarm      AlarmConfig
+	Monitoring MonitoringConfig
 }
 
 type ServerConfig struct {
@@ -71,6 +72,16 @@ type AlarmConfig struct {
 	PendingCheckSec  int
 }
 
+type MonitoringConfig struct {
+	PprofEnabled   bool
+	PprofPort      string
+	MetricsEnabled bool
+	MetricsPort    string
+	GzipEnabled    bool
+	GzipLevel      int
+	GzipMinSize    int
+}
+
 func Load() *Config {
 	if err := godotenv.Load(); err != nil {
 		log.Printf("Warning: .env file not found: %v", err)
@@ -125,7 +136,23 @@ func Load() *Config {
 			RecentHours:        getEnvInt("WEATHER_RECENT_HOURS", 24),
 			RunIntervalHr:      getEnvInt("WEATHER_RUN_INTERVAL_HR", 6),
 		},
+		Monitoring: MonitoringConfig{
+			PprofEnabled:   getEnvBool("PPROF_ENABLED", true),
+			PprofPort:      getEnvStr("PPROF_PORT", "6060"),
+			MetricsEnabled: getEnvBool("METRICS_ENABLED", true),
+			MetricsPort:    getEnvStr("METRICS_PORT", "9090"),
+			GzipEnabled:    getEnvBool("GZIP_ENABLED", true),
+			GzipLevel:      getEnvInt("GZIP_LEVEL", 5),
+			GzipMinSize:    getEnvInt("GZIP_MIN_SIZE", 1024),
+		},
 	}
+}
+
+func getEnvBool(key string, defaultValue bool) bool {
+	if v := os.Getenv(key); v != "" {
+		return v == "true" || v == "1" || v == "yes"
+	}
+	return defaultValue
 }
 
 func getEnvStr(key, defaultValue string) string {

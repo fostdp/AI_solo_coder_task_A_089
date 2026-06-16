@@ -334,6 +334,157 @@ BEFORE INSERT ON sensor_readings
 FOR EACH ROW EXECUTE FUNCTION process_sensor_reading();
 
 -- ============================================================
+-- 10. 连续聚合视图 - 小时级汇总
+-- ============================================================
+CREATE MATERIALIZED VIEW IF NOT EXISTS sensor_hourly_summary
+WITH (timescaledb.continuous) AS
+SELECT
+    site_id,
+    time_bucket('1 hour', time) AS bucket_hour,
+    COUNT(*) AS reading_count,
+    AVG(beam_strain_top) AS avg_strain_top,
+    AVG(beam_strain_bottom) AS avg_strain_bottom,
+    AVG(beam_strain_side) AS avg_strain_side,
+    AVG(avg_strain) AS avg_strain,
+    MAX(avg_strain) AS max_strain,
+    AVG(rock_crack_width_1) AS avg_crack_1,
+    AVG(rock_crack_width_2) AS avg_crack_2,
+    AVG(rock_crack_width_3) AS avg_crack_3,
+    AVG(max_crack_width) AS avg_crack,
+    MAX(max_crack_width) AS max_crack,
+    AVG(temperature) AS avg_temp,
+    MIN(temperature) AS min_temp,
+    MAX(temperature) AS max_temp,
+    AVG(humidity) AS avg_humidity,
+    SUM(rainfall) AS total_rainfall,
+    SUM(CASE WHEN strain_alarm THEN 1 ELSE 0 END) AS strain_alarm_count,
+    SUM(CASE WHEN crack_alarm THEN 1 ELSE 0 END) AS crack_alarm_count
+FROM sensor_readings
+GROUP BY site_id, time_bucket('1 hour', time)
+WITH NO DATA;
+
+SELECT add_continuous_aggregate_policy('sensor_hourly_summary',
+    start_offset => INTERVAL '1 day',
+    end_offset => INTERVAL '5 minutes',
+    schedule_interval => INTERVAL '15 minutes',
+    if_not_exists => TRUE
+);
+
+-- ============================================================
+-- 11. 连续聚合视图 - 周级汇总
+-- ============================================================
+CREATE MATERIALIZED VIEW IF NOT EXISTS sensor_weekly_summary
+WITH (timescaledb.continuous) AS
+SELECT
+    site_id,
+    time_bucket('7 days', bucket_day) AS bucket_week,
+    SUM(reading_count) AS reading_count,
+    AVG(avg_daily_strain) AS avg_strain,
+    MAX(max_daily_strain) AS max_strain,
+    AVG(avg_daily_crack) AS avg_crack,
+    MAX(max_daily_crack) AS max_crack,
+    AVG(avg_temp) AS avg_temp,
+    MIN(min_temp) AS min_temp,
+    MAX(max_temp) AS max_temp,
+    AVG(avg_humidity) AS avg_humidity,
+    SUM(alarm_count) AS alarm_count
+FROM sensor_daily_summary
+GROUP BY site_id, time_bucket('7 days', bucket_day)
+WITH NO DATA;
+
+SELECT add_continuous_aggregate_policy('sensor_weekly_summary',
+    start_offset => INTERVAL '1 month',
+    end_offset => INTERVAL '1 day',
+    schedule_interval => INTERVAL '1 day',
+    if_not_exists => TRUE
+);
+
+-- ============================================================
+-- 12. 连续聚合视图 - 月级汇总
+-- ============================================================
+CREATE MATERIALIZED VIEW IF NOT EXISTS sensor_monthly_summary
+WITH (timescaledb.continuous) AS
+SELECT
+    site_id,
+    time_bucket('30 days', bucket_day) AS bucket_month,
+    SUM(reading_count) AS reading_count,
+    AVG(avg_daily_strain) AS avg_strain,
+    MAX(max_daily_strain) AS max_strain,
+    AVG(avg_daily_crack) AS avg_crack,
+    MAX(max_daily_crack) AS max_crack,
+    AVG(avg_temp) AS avg_temp,
+    MIN(min_temp) AS min_temp,
+    MAX(max_temp) AS max_temp,
+    AVG(avg_humidity) AS avg_humidity,
+    SUM(alarm_count) AS alarm_count
+FROM sensor_daily_summary
+GROUP BY site_id, time_bucket('30 days', bucket_day)
+WITH NO DATA;
+
+SELECT add_continuous_aggregate_policy('sensor_monthly_summary',
+    start_offset => INTERVAL '3 months',
+    end_offset => INTERVAL '1 day',
+    schedule_interval => INTERVAL '1 week',
+    if_not_exists => TRUE
+);
+
+-- ============================================================
+-- 13. 数据保留策略 (Retention Policies)
+-- ============================================================
+-- 原始高频数据: 保留3个月
+SELECT add_retention_policy('sensor_readings',
+    drop_after => INTERVAL '3 months',
+    if_not_exists => TRUE
+);
+
+-- 小时级汇总: 保留1年
+SELECT add_retention_policy('sensor_hourly_summary',
+    drop_after => INTERVAL '1 year',
+    if_not_exists => TRUE
+);
+
+-- 天级汇总: 保留5年
+SELECT add_retention_policy('sensor_daily_summary',
+    drop_after => INTERVAL '5 years',
+    if_not_exists => TRUE
+);
+
+-- 周级和月级汇总: 永久保留
+
+-- ============================================================
+-- 14. 数据压缩策略
+-- ============================================================
+ALTER TABLE sensor_readings SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'site_id, beam_id',
+    timescaledb.compress_orderby = 'time DESC'
+);
+
+SELECT add_compression_policy('sensor_readings',
+    compress_after => INTERVAL '7 days',
+    if_not_exists => TRUE
+);
+
+ALTER TABLE alarm_events SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'site_id, alarm_type',
+    timescaledb.compress_orderby = 'time DESC'
+);
+
+SELECT add_compression_policy('alarm_events',
+    compress_after => INTERVAL '30 days',
+    if_not_exists => TRUE
+);
+
+-- ============================================================
+-- 15. 重排序策略 (保持数据有序)
+-- ============================================================
+SELECT add_reorder_policy('sensor_readings',
+    index => 'idx_sensor_site_time',
+    if_not_exists => TRUE
+);
+
+-- ============================================================
 -- 完成
 -- ============================================================
 \echo '========================================'
@@ -341,4 +492,11 @@ FOR EACH ROW EXECUTE FUNCTION process_sensor_reading();
 \echo 'TimescaleDB hypertables 已创建'
 \echo '10处秦巴山区栈道遗址已录入'
 \echo '告警触发器已启用'
+\echo '数据保留策略:'
+\echo '  原始数据: 3个月'
+\echo '  小时级汇总: 1年'
+\echo '  天级汇总: 5年'
+\echo '  周级/月级汇总: 永久保留'
+\echo '数据压缩策略: 7天后自动压缩'
+\echo '连续聚合视图: 小时/天/周/月 四级汇总'
 \echo '========================================'

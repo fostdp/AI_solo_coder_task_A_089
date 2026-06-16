@@ -648,7 +648,7 @@ func getWoodParams(name string) WoodDecayParams {
 	if p, ok := WoodParams[name]; ok {
 		return p
 	}
-	return WoodParams{InitMoisture: 12.0, DecayCoeff: 0.005, TempCoeff: 0.085, HumidCoeff: 0.005, BiologicalFactor: 0.75, LigninContent: 0.30, DurabilityClass: 2}
+	return WoodDecayParams{InitMoisture: 12.0, DecayCoeff: 0.005, TempCoeff: 0.085, HumidCoeff: 0.005, BiologicalFactor: 0.75, LigninContent: 0.30, DurabilityClass: 2}
 }
 
 func round4(v float64) float64 {

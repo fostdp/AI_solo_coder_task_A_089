@@ -20,6 +20,8 @@ import (
 	"plankroad-backend/config/params"
 	"plankroad-backend/database"
 	"plankroad-backend/handlers"
+	"plankroad-backend/middleware"
+	"plankroad-backend/monitoring"
 	"plankroad-backend/modules/alarm_mqtt"
 	"plankroad-backend/modules/bus"
 	"plankroad-backend/modules/dtu_receiver"
@@ -30,6 +32,7 @@ import (
 type App struct {
 	cfg             *config.Config
 	logger          *log.Logger
+	metrics         *monitoring.Metrics
 	messageBus      *bus.Bus
 	dtuReceiver     *dtu_receiver.DTUReceiver
 	structuralSim   *structural_simulator.StructuralSimulator
@@ -85,6 +88,19 @@ func (a *App) init() error {
 	}
 	a.logger.Printf("Database connected: %s:%d/%s", cfg.Database.Host, cfg.Database.Port, cfg.Database.Name)
 
+	a.metrics = monitoring.NewMetrics(a.logger)
+	if a.cfg.Monitoring.PprofEnabled {
+		if err := a.metrics.StartPProf(a.cfg.Monitoring.PprofPort); err != nil {
+			a.logger.Printf("Warning: PProf server failed to start: %v", err)
+		}
+	}
+	if a.cfg.Monitoring.MetricsEnabled {
+		if err := a.metrics.StartMetrics(a.cfg.Monitoring.MetricsPort); err != nil {
+			a.logger.Printf("Warning: Metrics server failed to start: %v", err)
+		}
+	}
+	a.logger.Println("Monitoring initialized")
+
 	a.messageBus = bus.New(a.logger)
 	a.logger.Println("Message bus initialized")
 
@@ -133,6 +149,18 @@ func (a *App) setupGin() {
 	gin.SetMode(gin.ReleaseMode)
 	a.ginEngine = gin.New()
 	a.ginEngine.Use(gin.Recovery())
+
+	if a.cfg.Monitoring.GzipEnabled {
+		a.ginEngine.Use(middleware.GzipMinSize(a.cfg.Monitoring.GzipMinSize, a.cfg.Monitoring.GzipLevel))
+		a.logger.Printf("Gzip compression enabled (min size: %d bytes, level: %d)",
+			a.cfg.Monitoring.GzipMinSize, a.cfg.Monitoring.GzipLevel)
+	}
+
+	if a.cfg.Monitoring.MetricsEnabled {
+		a.ginEngine.Use(middleware.PrometheusMetrics(a.metrics))
+		a.logger.Println("Prometheus metrics middleware enabled")
+	}
+
 	a.ginEngine.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
 		return a.logger.Prefix() + "HTTP " + param.Method + " " + param.Path +
 			" " + fmt.Sprintf("%d", param.StatusCode) + " " + param.Latency.String() + "\n"
@@ -272,6 +300,16 @@ func (a *App) waitForShutdown() {
 
 func (a *App) cleanup() {
 	a.logger.Println("Cleaning up resources...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), a.shutdownTimeout)
+	defer cancel()
+
+	if a.metrics != nil {
+		if err := a.metrics.Shutdown(ctx); err != nil {
+			a.logger.Printf("  ⚠ Metrics server shutdown error: %v", err)
+		}
+		a.logger.Println("  ✓ Metrics server closed")
+	}
 
 	if a.dtuReceiver != nil {
 		a.dtuReceiver.Close()
