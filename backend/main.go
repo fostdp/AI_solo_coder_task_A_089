@@ -4,228 +4,299 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
+
 	"plankroad-backend/config"
+	"plankroad-backend/config/params"
 	"plankroad-backend/database"
 	"plankroad-backend/handlers"
-	"plankroad-backend/mqttclient"
-	"plankroad-backend/repository"
-	"plankroad-backend/simulation"
-	"plankroad-backend/weathering"
+	"plankroad-backend/modules/alarm_mqtt"
+	"plankroad-backend/modules/bus"
+	"plankroad-backend/modules/dtu_receiver"
+	"plankroad-backend/modules/structural_simulator"
+	"plankroad-backend/modules/weathering_evaluator"
 )
 
-func main() {
-	cfg := config.Load()
-
-	if cfg.Server.Mode == "release" {
-		gin.SetMode(gin.ReleaseMode)
-	}
-
-	if err := database.Init(&cfg.Database); err != nil {
-		log.Fatalf("Database init failed: %v", err)
-	}
-	defer database.Close()
-
-	alarmRepo := repository.NewAlarmRepo()
-	sensorRepo := repository.NewSensorRepo()
-
-	mqttCli := mqttclient.NewClient(&cfg.MQTT, alarmRepo, sensorRepo)
-	if err := mqttCli.Connect(); err != nil {
-		log.Printf("MQTT connect warning (continuing without MQTT): %v", err)
-	}
-	defer mqttCli.Disconnect()
-
-	h := handlers.NewHandler(cfg, mqttCli)
-	rootCtx := context.Background()
-	h.LoadSiteNames(rootCtx)
-
-	go startScheduledTasks(cfg, h)
-	go startAlarmProcessor(mqttCli, h)
-
-	r := setupRouter(h)
-
-	srv := &http.Server{
-		Addr:         fmt.Sprintf(":%d", cfg.Server.Port),
-		Handler:      r,
-		ReadTimeout:  60 * time.Second,
-		WriteTimeout: 60 * time.Second,
-		IdleTimeout:  120 * time.Second,
-	}
-
-	go func() {
-		log.Printf("Server starting on :%d (mode=%s)", cfg.Server.Port, cfg.Server.Mode)
-		log.Printf("API endpoints:")
-		log.Printf("  GET    /api/sites                  栈道遗址列表")
-		log.Printf("  GET    /api/sites/:id              单遗址详情")
-		log.Printf("  POST   /api/sensor                 传感器数据上报")
-		log.Printf("  POST   /api/sensor/batch           批量传感器数据上报")
-		log.Printf("  GET    /api/sensor                 查询传感器数据")
-		log.Printf("  GET    /api/sites/:id/daily        每日汇总")
-		log.Printf("  POST   /api/sites/:id/simulate     结构仿真(有限元)")
-		log.Printf("  GET    /api/sites/:id/simulation   最新仿真结果")
-		log.Printf("  POST   /api/sites/:id/weathering   风化评估")
-		log.Printf("  GET    /api/sites/:id/weathering   最新风化评估")
-		log.Printf("  GET    /api/alarms                 告警列表")
-		log.Printf("  GET    /api/dashboard              仪表盘数据")
-
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server failed: %v", err)
-		}
-	}()
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	log.Println("Shutting down server...")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		log.Fatalf("Server forced to shutdown: %v", err)
-	}
-
-	log.Println("Server exited")
+type App struct {
+	cfg             *config.Config
+	logger          *log.Logger
+	messageBus      *bus.Bus
+	dtuReceiver     *dtu_receiver.DTUReceiver
+	structuralSim   *structural_simulator.StructuralSimulator
+	weatheringEval  *weathering_evaluator.WeatheringEvaluator
+	alarmMQTT       *alarm_mqtt.AlarmMQTT
+	handler         *handlers.Handler
+	ginEngine       *gin.Engine
+	wg              sync.WaitGroup
+	shutdownTimeout time.Duration
 }
 
-func setupRouter(h *handlers.Handler) *gin.Engine {
-	r := gin.Default()
+func main() {
+	app := &App{
+		logger:          log.New(os.Stdout, "[PLANKROAD] ", log.LstdFlags|log.Lmicroseconds),
+		shutdownTimeout: 30 * time.Second,
+	}
 
-	r.Use(cors.New(cors.Config{
+	if err := app.init(); err != nil {
+		app.logger.Fatalf("Initialization failed: %v", err)
+	}
+	defer app.cleanup()
+
+	app.startScheduledTasks()
+	app.startHTTPServer()
+	app.waitForShutdown()
+}
+
+func (a *App) init() error {
+	a.logger.Println("========================================")
+	a.logger.Println("  秦巴山区古栈道结构力学仿真与风化评估系统")
+	a.logger.Println("  模块化架构启动")
+	a.logger.Println("========================================")
+
+	if err := godotenv.Load(); err != nil {
+		a.logger.Printf("Warning: .env file not found, using defaults: %v", err)
+	}
+
+	cfg := config.Load()
+	a.cfg = cfg
+
+	workDir, _ := os.Getwd()
+	a.logger.Printf("Working directory: %s", workDir)
+
+	paramsPath := filepath.Join(workDir, "config", "params")
+	if err := params.LoadAll(paramsPath); err != nil {
+		return a.fail("load params JSON", err)
+	}
+	a.logger.Printf("Loaded %d rock types + %d wood types from JSON config",
+		len(params.LoadedRockParams), len(params.LoadedWoodParams))
+
+	if err := database.Init(&cfg.Database); err != nil {
+		return a.fail("init database", err)
+	}
+	a.logger.Printf("Database connected: %s:%d/%s", cfg.Database.Host, cfg.Database.Port, cfg.Database.Name)
+
+	a.messageBus = bus.New(a.logger)
+	a.logger.Println("Message bus initialized")
+
+	a.logger.Println("--- Initializing modules ---")
+
+	var err error
+	a.dtuReceiver, err = dtu_receiver.New(cfg, a.messageBus, a.logger)
+	if err != nil {
+		return a.fail("init DTU receiver", err)
+	}
+	a.logger.Println("✓ DTU Receiver (data acquisition + validation) initialized")
+
+	a.alarmMQTT, err = alarm_mqtt.New(cfg, a.messageBus, a.logger)
+	if err != nil {
+		a.logger.Printf("Warning: alarm MQTT init failed: %v", err)
+	}
+	a.logger.Println("✓ Alarm MQTT (alarm evaluation + push) initialized")
+
+	a.structuralSim, err = structural_simulator.New(cfg, a.messageBus, a.logger, a.alarmMQTT)
+	if err != nil {
+		return a.fail("init structural simulator", err)
+	}
+	a.logger.Println("✓ Structural Simulator (FEM + contact algorithm) initialized")
+
+	a.weatheringEval, err = weathering_evaluator.New(cfg, a.messageBus, a.logger, a.alarmMQTT)
+	if err != nil {
+		return a.fail("init weathering evaluator", err)
+	}
+	a.logger.Println("✓ Weathering Evaluator (freeze-thaw + crack propagation) initialized")
+
+	a.handler = handlers.New(cfg, a.messageBus, a.dtuReceiver, a.structuralSim, a.weatheringEval, a.alarmMQTT)
+	a.logger.Println("✓ API Handler initialized")
+
+	a.setupGin()
+	a.logger.Println("✓ Gin router initialized")
+
+	a.alarmMQTT.StartAlarmProcessor(time.Duration(cfg.Alarm.PendingCheckSec) * time.Second)
+	a.logger.Println("✓ Alarm processor started")
+
+	a.logger.Println("--- All modules initialized successfully ---")
+	a.logger.Printf("Go version: %s | GOMAXPROCS: %d", runtime.Version(), runtime.GOMAXPROCS(0))
+	return nil
+}
+
+func (a *App) setupGin() {
+	gin.SetMode(gin.ReleaseMode)
+	a.ginEngine = gin.New()
+	a.ginEngine.Use(gin.Recovery())
+	a.ginEngine.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
+		return a.logger.Prefix() + "HTTP " + param.Method + " " + param.Path +
+			" " + fmt.Sprintf("%d", param.StatusCode) + " " + param.Latency.String() + "\n"
+	}))
+
+	a.ginEngine.Use(cors.New(cors.Config{
 		AllowOrigins:     []string{"*"},
-		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
+		AllowMethods:     []string{"GET", "POST", "PUT", "OPTIONS"},
+		AllowHeaders:     []string{"*"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}))
 
-	r.Static("/static", "./static")
-	r.StaticFile("/", "./static/index.html")
+	a.ginEngine.Static("/static", "./static")
+	a.ginEngine.StaticFile("/", "./static/index.html")
+	a.ginEngine.StaticFile("/texture_params.json", "./config/params/texture_params.json")
 
-	api := r.Group("/api")
+	api := a.ginEngine.Group("/api")
 	{
-		api.GET("/sites", h.GetSites)
-		api.GET("/sites/:id", h.GetSite)
-		api.GET("/sites/:id/daily", h.GetDailySummary)
-		api.GET("/sites/:id/simulation", h.GetLatestSimulation)
-		api.GET("/sites/:id/weathering", h.GetLatestWeathering)
-		api.GET("/sites/:id/thresholds", h.GetThresholds)
+		api.GET("/sites", a.handler.GetSites)
+		api.GET("/sites/:id", a.handler.GetSite)
 
-		api.POST("/sensor", h.PostSensorReading)
-		api.POST("/sensor/batch", h.PostBatchSensorReadings)
-		api.GET("/sensor", h.GetSensorReadings)
+		api.POST("/sensor/batch", a.handler.PostBatchSensorReadings)
+		api.POST("/sensor/single", a.handler.PostSingleSensorReading)
+		api.GET("/sites/:id/readings", a.handler.GetRecentReadings)
 
-		api.POST("/sites/:id/simulate", h.RunSimulation)
-		api.POST("/sites/:id/weathering", h.RunWeathering)
+		api.POST("/sites/:id/simulate", a.handler.RunSimulation)
+		api.POST("/simulate/all", a.handler.TriggerSimAll)
+		api.GET("/sites/:id/simulation", a.handler.GetLatestSimulation)
 
-		api.GET("/alarms", h.GetAlarms)
-		api.POST("/alarms/:id/ack", h.AckAlarm)
-		api.POST("/alarms/:id/resolve", h.ResolveAlarm)
+		api.POST("/sites/:id/weathering", a.handler.RunWeathering)
+		api.POST("/weathering/all", a.handler.TriggerWeatheringAll)
+		api.GET("/sites/:id/weathering", a.handler.GetLatestWeathering)
 
-		api.GET("/dashboard", h.GetDashboard)
+		api.GET("/alarms", a.handler.GetAlarms)
+		api.POST("/alarms/:id/ack", a.handler.AckAlarm)
+		api.POST("/alarms/:id/resolve", a.handler.ResolveAlarm)
+
+		api.GET("/dashboard", a.handler.GetDashboard)
+		api.GET("/sites/:id/summary", a.handler.GetDailySummary)
 	}
-
-	return r
 }
 
-func startScheduledTasks(cfg *config.Config, h *handlers.Handler) {
-	simTicker := time.NewTicker(1 * time.Hour)
-	weatherTicker := time.NewTicker(6 * time.Hour)
-	defer simTicker.Stop()
-	defer weatherTicker.Stop()
+func (a *App) startScheduledTasks() {
+	a.logger.Println("Starting scheduled tasks...")
 
-	siteRepo := repository.NewSiteRepo()
-	sensorRepo := repository.NewSensorRepo()
-	simRepo := repository.NewSimulationRepo()
-	weatherRepo := repository.NewWeatheringRepo()
+	simTicker := time.NewTicker(time.Duration(a.cfg.FEM.RunIntervalHr) * time.Hour)
+	weatherTicker := time.NewTicker(time.Duration(a.cfg.Weather.RunIntervalHr) * time.Hour)
 
-	femSolver := simulation.NewSolver(&cfg.FEM)
-	assessor := weathering.NewAssessor(&cfg.Weather)
-
-	mqttClient := h.MQTTClient()
-
-	for {
-		select {
-		case <-simTicker.C:
-			runStructuralSimulations(siteRepo, sensorRepo, simRepo, femSolver, mqttClient)
-		case <-weatherTicker.C:
-			runWeatheringAssessments(siteRepo, sensorRepo, simRepo, weatherRepo, assessor, mqttClient)
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		a.logger.Printf("Structural simulation scheduled every %dh", a.cfg.FEM.RunIntervalHr)
+		for range simTicker.C {
+			a.logger.Println("[TIMER] Running structural simulations for all sites...")
+			if err := a.structuralSim.RunAll("timer"); err != nil {
+				a.logger.Printf("[TIMER] Simulations failed: %v", err)
+			}
 		}
-	}
+	}()
+
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		a.logger.Printf("Weathering assessment scheduled every %dh", a.cfg.Weather.RunIntervalHr)
+		for range weatherTicker.C {
+			a.logger.Println("[TIMER] Running weathering assessments for all sites...")
+			if err := a.weatheringEval.RunAll("timer"); err != nil {
+				a.logger.Printf("[TIMER] Assessments failed: %v", err)
+			}
+		}
+	}()
+
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		healthTicker := time.NewTicker(60 * time.Second)
+		for range healthTicker.C {
+			metrics := a.messageBus.GetMetrics()
+			a.logger.Printf("[HEALTH] Bus events: %+v", metrics)
+		}
+	}()
+
+	go func() {
+		time.Sleep(5 * time.Second)
+		a.logger.Println("[INIT] Running initial structural simulation...")
+		if _, err := a.structuralSim.RunForSite(1, "init"); err != nil {
+			a.logger.Printf("[INIT] Initial sim failed: %v", err)
+		}
+
+		time.Sleep(3 * time.Second)
+		a.logger.Println("[INIT] Running initial weathering assessment...")
+		if _, err := a.weatheringEval.RunForSite(1, "init"); err != nil {
+			a.logger.Printf("[INIT] Initial weathering failed: %v", err)
+		}
+	}()
 }
 
-func runStructuralSimulations(sr *repository.SiteRepo, sens *repository.SensorRepo,
-	simRepo *repository.SimulationRepo, solver *simulation.Solver, mqtt *mqttclient.Client) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+func (a *App) startHTTPServer() {
+	addr := ":" + fmt.Sprintf("%d", a.cfg.Server.Port)
+	a.logger.Printf("HTTP server starting on %s", addr)
+
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		if err := a.ginEngine.Run(addr); err != nil {
+			a.logger.Printf("HTTP server stopped: %v", err)
+		}
+	}()
+}
+
+func (a *App) waitForShutdown() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	sig := <-sigCh
+	a.logger.Printf("Received signal: %v, initiating graceful shutdown...", sig)
+
+	ctx, cancel := context.WithTimeout(context.Background(), a.shutdownTimeout)
 	defer cancel()
 
-	sites, err := sr.GetAll(ctx)
-	if err != nil {
-		log.Printf("[FEM] get sites error: %v", err)
-		return
-	}
+	done := make(chan struct{})
+	go func() {
+		a.cleanup()
+		close(done)
+	}()
 
-	for _, site := range sites {
-		go func(s models.PlankroadSite) {
-			readings, _ := sens.GetBySite(ctx, s.SiteID, time.Now().Add(-48*time.Hour), time.Now(), 500)
-			sim, err := solver.Simulate(&s, readings)
-			if err != nil {
-				log.Printf("[FEM] site %d error: %v", s.SiteID, err)
-				return
-			}
-			if err := simRepo.Save(ctx, sim); err != nil {
-				log.Printf("[FEM] save site %d error: %v", s.SiteID, err)
-				return
-			}
-			mqtt.PublishSimulation(s.SiteID, sim)
-		}(site)
+	select {
+	case <-done:
+		a.logger.Println("Graceful shutdown completed")
+	case <-ctx.Done():
+		a.logger.Printf("Shutdown timed out after %v, force exiting", a.shutdownTimeout)
+		os.Exit(1)
 	}
 }
 
-func runWeatheringAssessments(sr *repository.SiteRepo, sens *repository.SensorRepo,
-	simRepo *repository.SimulationRepo, wr *repository.WeatheringRepo,
-	assessor *weathering.Assessor, mqtt *mqttclient.Client) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	defer cancel()
+func (a *App) cleanup() {
+	a.logger.Println("Cleaning up resources...")
 
-	sites, err := sr.GetAll(ctx)
-	if err != nil {
-		log.Printf("[Weathering] get sites error: %v", err)
-		return
+	if a.dtuReceiver != nil {
+		a.dtuReceiver.Close()
+		a.logger.Println("  ✓ DTU Receiver closed")
 	}
 
-	for _, site := range sites {
-		go func(s models.PlankroadSite) {
-			readings, _ := sens.GetBySite(ctx, s.SiteID, time.Now().Add(-720*time.Hour), time.Now(), 2000)
-			sim, _ := simRepo.GetLatest(ctx, s.SiteID)
-			assess := assessor.Assess(&s, readings, sim)
-			if err := wr.Save(ctx, assess); err != nil {
-				log.Printf("[Weathering] save site %d error: %v", s.SiteID, err)
-				return
-			}
-			mqtt.PublishWeathering(s.SiteID, assess)
-		}(site)
+	if a.alarmMQTT != nil {
+		a.alarmMQTT.Close()
+		a.logger.Println("  ✓ Alarm MQTT closed")
 	}
+
+	if a.messageBus != nil {
+		a.messageBus.Close()
+		a.logger.Println("  ✓ Message bus closed")
+	}
+
+	if database.Pool != nil {
+		database.Pool.Close()
+		a.logger.Println("  ✓ Database connection closed")
+	}
+
+	a.logger.Println("All resources released")
 }
 
-func startAlarmProcessor(mqttCli *mqttclient.Client, h *handlers.Handler) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		published, err := mqttCli.ProcessPendingAlarms(ctx, h.SiteNames())
-		cancel()
-		if err != nil {
-			continue
-		}
-		_ = published
-	}
+func (a *App) fail(step string, err error) error {
+	a.logger.Fatalf("Failed at step [%s]: %v", step, err)
+	return err
 }

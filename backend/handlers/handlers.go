@@ -7,381 +7,323 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
 	"plankroad-backend/config"
-	"plankroad-backend/models"
-	"plankroad-backend/mqttclient"
-	"plankroad-backend/repository"
-	"plankroad-backend/simulation"
-	"plankroad-backend/weathering"
+	"plankroad-backend/modules/alarm_mqtt"
+	"plankroad-backend/modules/bus"
+	"plankroad-backend/modules/dtu_receiver"
+	"plankroad-backend/modules/structural_simulator"
+	"plankroad-backend/modules/weathering_evaluator"
 )
 
 type Handler struct {
-	siteRepo    *repository.SiteRepo
-	sensorRepo  *repository.SensorRepo
-	simRepo     *repository.SimulationRepo
-	weatherRepo *repository.WeatheringRepo
-	alarmRepo   *repository.AlarmRepo
-	femSolver   *simulation.Solver
-	assessor    *weathering.Assessor
-	mqttCli     *mqttclient.Client
-	cfg         *config.Config
-	siteNames   map[int]string
+	cfg                *config.Config
+	bus                *bus.Bus
+	dtuReceiver        *dtu_receiver.DTUReceiver
+	structuralSim      *structural_simulator.StructuralSimulator
+	weatheringEval     *weathering_evaluator.WeatheringEvaluator
+	alarmMQTT          *alarm_mqtt.AlarmMQTT
 }
 
-func NewHandler(cfg *config.Config, mqtt *mqttclient.Client) *Handler {
+func New(cfg *config.Config, b *bus.Bus,
+	dtu *dtu_receiver.DTUReceiver,
+	sim *structural_simulator.StructuralSimulator,
+	we *weathering_evaluator.WeatheringEvaluator,
+	al *alarm_mqtt.AlarmMQTT) *Handler {
+
 	return &Handler{
-		siteRepo:    repository.NewSiteRepo(),
-		sensorRepo:  repository.NewSensorRepo(),
-		simRepo:     repository.NewSimulationRepo(),
-		weatherRepo: repository.NewWeatheringRepo(),
-		alarmRepo:   repository.NewAlarmRepo(),
-		femSolver:   simulation.NewSolver(&cfg.FEM),
-		assessor:    weathering.NewAssessor(&cfg.Weather),
-		mqttCli:     mqtt,
-		cfg:         cfg,
-		siteNames:   make(map[int]string),
+		cfg:            cfg,
+		bus:            b,
+		dtuReceiver:    dtu,
+		structuralSim:  sim,
+		weatheringEval: we,
+		alarmMQTT:      al,
 	}
-}
-
-func (h *Handler) LoadSiteNames(ctx context.Context) {
-	sites, err := h.siteRepo.GetAll(ctx)
-	if err == nil {
-		for _, s := range sites {
-			h.siteNames[s.SiteID] = s.SiteName
-		}
-	}
-}
-
-func (h *Handler) MQTTClient() *mqttclient.Client {
-	return h.mqttCli
-}
-
-func (h *Handler) SiteNames() map[int]string {
-	return h.siteNames
-}
-
-type Response struct {
-	Code    int         `json:"code"`
-	Message string      `json:"message,omitempty"`
-	Data    interface{} `json:"data,omitempty"`
-}
-
-func ok(c *gin.Context, data interface{}) {
-	c.JSON(http.StatusOK, Response{Code: 0, Data: data})
-}
-
-func fail(c *gin.Context, code int, msg string) {
-	c.JSON(code, Response{Code: code, Message: msg})
 }
 
 func (h *Handler) GetSites(c *gin.Context) {
-	sites, err := h.siteRepo.GetAll(c.Request.Context())
+	ctx := c.Request.Context()
+	sites, err := h.dtuReceiver.GetSiteRepo().GetAll(ctx)
 	if err != nil {
-		fail(c, http.StatusInternalServerError, err.Error())
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	ok(c, sites)
+	c.JSON(http.StatusOK, sites)
 }
 
 func (h *Handler) GetSite(c *gin.Context) {
-	id, _ := strconv.Atoi(c.Param("id"))
-	site, err := h.siteRepo.GetByID(c.Request.Context(), id)
+	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		fail(c, http.StatusNotFound, "site not found")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid site id"})
 		return
 	}
-	ok(c, site)
-}
-
-func (h *Handler) PostSensorReading(c *gin.Context) {
-	var data models.SensorReading
-	if err := c.ShouldBindJSON(&data); err != nil {
-		fail(c, http.StatusBadRequest, "invalid payload: "+err.Error())
+	ctx := c.Request.Context()
+	site, err := h.dtuReceiver.GetSiteRepo().GetByID(ctx, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if data.Time.IsZero() {
-		data.Time = time.Now()
-	}
-
-	if err := h.sensorRepo.InsertReading(c.Request.Context(), &data); err != nil {
-		fail(c, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	go h.checkMQTTAlarms()
-
-	c.JSON(http.StatusCreated, Response{Code: 0, Message: "received"})
+	c.JSON(http.StatusOK, site)
 }
 
 func (h *Handler) PostBatchSensorReadings(c *gin.Context) {
-	var readings []models.SensorReading
-	if err := c.ShouldBindJSON(&readings); err != nil {
-		fail(c, http.StatusBadRequest, "invalid payload: "+err.Error())
-		return
-	}
-
-	now := time.Now()
-	for i := range readings {
-		if readings[i].Time.IsZero() {
-			readings[i].Time = now
-		}
-	}
-
-	if err := h.sensorRepo.BatchInsert(c.Request.Context(), readings); err != nil {
-		fail(c, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	go h.checkMQTTAlarms()
-
-	ok(c, gin.H{"inserted": len(readings)})
+	h.dtuReceiver.HandleHTTPBatch(c)
 }
 
-func (h *Handler) GetSensorReadings(c *gin.Context) {
-	siteID, _ := strconv.Atoi(c.Query("site_id"))
-	hours, _ := strconv.Atoi(c.DefaultQuery("hours", "24"))
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "1000"))
-
-	start := time.Now().Add(-time.Duration(hours) * time.Hour)
-	end := time.Now()
-
-	readings, err := h.sensorRepo.GetBySite(c.Request.Context(), siteID, start, end, limit)
-	if err != nil {
-		fail(c, http.StatusInternalServerError, err.Error())
-		return
-	}
-	ok(c, readings)
-}
-
-func (h *Handler) GetDailySummary(c *gin.Context) {
-	siteID, _ := strconv.Atoi(c.Param("id"))
-	days, _ := strconv.Atoi(c.DefaultQuery("days", "7"))
-
-	summary, err := h.sensorRepo.GetDailySummary(c.Request.Context(), siteID, days)
-	if err != nil {
-		fail(c, http.StatusInternalServerError, err.Error())
-		return
-	}
-	ok(c, summary)
+func (h *Handler) PostSingleSensorReading(c *gin.Context) {
+	h.dtuReceiver.HandleHTTPSingle(c)
 }
 
 func (h *Handler) RunSimulation(c *gin.Context) {
-	siteID, _ := strconv.Atoi(c.Param("id"))
-	ctx := c.Request.Context()
-
-	site, err := h.siteRepo.GetByID(ctx, siteID)
+	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		fail(c, http.StatusNotFound, "site not found")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid site id"})
 		return
 	}
 
-	start := time.Now().Add(-48 * time.Hour)
-	readings, err := h.sensorRepo.GetBySite(ctx, siteID, start, time.Now(), 500)
+	sim, err := h.structuralSim.RunForSite(id, "api")
 	if err != nil {
-		readings = []models.SensorReading{}
-	}
-
-	sim, err := h.femSolver.Simulate(site, readings)
-	if err != nil {
-		fail(c, http.StatusInternalServerError, "simulation failed: "+err.Error())
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	if err := h.simRepo.Save(ctx, sim); err != nil {
-		fail(c, http.StatusInternalServerError, "save simulation failed: "+err.Error())
-		return
-	}
-
-	go h.mqttCli.PublishSimulation(siteID, sim)
-
-	ok(c, sim)
-}
-
-func (h *Handler) GetLatestSimulation(c *gin.Context) {
-	siteID, _ := strconv.Atoi(c.Param("id"))
-	sim, err := h.simRepo.GetLatest(c.Request.Context(), siteID)
-	if err != nil {
-		fail(c, http.StatusNotFound, "simulation not found")
-		return
-	}
-	ok(c, sim)
+	c.JSON(http.StatusOK, sim)
 }
 
 func (h *Handler) RunWeathering(c *gin.Context) {
-	siteID, _ := strconv.Atoi(c.Param("id"))
-	ctx := c.Request.Context()
-
-	site, err := h.siteRepo.GetByID(ctx, siteID)
+	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		fail(c, http.StatusNotFound, "site not found")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid site id"})
 		return
 	}
 
-	start := time.Now().Add(-720 * time.Hour)
-	readings, _ := h.sensorRepo.GetBySite(ctx, siteID, start, time.Now(), 2000)
-	sim, _ := h.simRepo.GetLatest(ctx, siteID)
-
-	assessment := h.assessor.Assess(site, readings, sim)
-
-	if err := h.weatherRepo.Save(ctx, assessment); err != nil {
-		fail(c, http.StatusInternalServerError, "save assessment failed: "+err.Error())
+	wa, err := h.weatheringEval.RunForSite(id, "api")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	go h.mqttCli.PublishWeathering(siteID, assessment)
+	c.JSON(http.StatusOK, wa)
+}
 
-	ok(c, assessment)
+func (h *Handler) GetRecentReadings(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid site id"})
+		return
+	}
+	hours, _ := strconv.Atoi(c.DefaultQuery("hours", "24"))
+	ctx := c.Request.Context()
+	endTime := time.Now()
+	startTime := endTime.Add(-time.Duration(hours) * time.Hour)
+	readings, err := h.dtuReceiver.GetSensorRepo().GetBySite(ctx, id, startTime, endTime, 1000)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, readings)
+}
+
+func (h *Handler) GetLatestSimulation(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid site id"})
+		return
+	}
+	ctx := c.Request.Context()
+	sim, err := h.structuralSim.GetSimRepo().GetLatest(ctx, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, sim)
 }
 
 func (h *Handler) GetLatestWeathering(c *gin.Context) {
-	siteID, _ := strconv.Atoi(c.Param("id"))
-	w, err := h.weatherRepo.GetLatest(c.Request.Context(), siteID)
+	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		fail(c, http.StatusNotFound, "weathering assessment not found")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid site id"})
 		return
 	}
-	ok(c, w)
+	ctx := c.Request.Context()
+	wa, err := h.weatheringEval.GetWeatherRepo().GetLatest(ctx, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, wa)
 }
 
 func (h *Handler) GetAlarms(c *gin.Context) {
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
 	siteID, _ := strconv.Atoi(c.DefaultQuery("site_id", "0"))
-	alarms, err := h.alarmRepo.GetUnresolved(c.Request.Context(), siteID)
+	ctx := c.Request.Context()
+
+	alarms, err := h.alarmMQTT.GetAlarmRepo().GetUnresolved(ctx, siteID)
 	if err != nil {
-		fail(c, http.StatusInternalServerError, err.Error())
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	ok(c, alarms)
+	if len(alarms) > limit {
+		alarms = alarms[:limit]
+	}
+	c.JSON(http.StatusOK, alarms)
 }
 
 func (h *Handler) AckAlarm(c *gin.Context) {
-	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	user := c.DefaultQuery("user", "system")
-	if err := h.alarmRepo.Acknowledge(c.Request.Context(), id, user); err != nil {
-		fail(c, http.StatusInternalServerError, err.Error())
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid alarm id"})
 		return
 	}
-	ok(c, gin.H{"acknowledged": true})
+
+	var body struct {
+		User string `json:"user"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		body.User = "system"
+	}
+
+	if err := h.alarmMQTT.AckAlarm(id, body.User); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "acknowledged"})
 }
 
 func (h *Handler) ResolveAlarm(c *gin.Context) {
-	id, _ := strconv.ParseInt(c.Param("id"), 10, 64)
-	if err := h.alarmRepo.Resolve(c.Request.Context(), id); err != nil {
-		fail(c, http.StatusInternalServerError, err.Error())
-		return
-	}
-	ok(c, gin.H{"resolved": true})
-}
-
-func (h *Handler) GetThresholds(c *gin.Context) {
-	siteID, _ := strconv.Atoi(c.Param("id"))
-	th, err := h.alarmRepo.GetThresholds(c.Request.Context(), siteID)
+	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
-		fail(c, http.StatusInternalServerError, err.Error())
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid alarm id"})
 		return
 	}
-	ok(c, th)
+
+	var body struct {
+		User    string `json:"user"`
+		Comment string `json:"comment"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		body.User = "system"
+	}
+
+	if err := h.alarmMQTT.ResolveAlarm(id, body.User, body.Comment); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "resolved"})
 }
 
 func (h *Handler) GetDashboard(c *gin.Context) {
 	ctx := c.Request.Context()
-	sites, _ := h.siteRepo.GetAll(ctx)
-
-	dashboard := struct {
-		TotalSites      int         `json:"total_sites"`
-		ActiveAlarms    int         `json:"active_alarms"`
-		CriticalAlarms  int         `json:"critical_alarms"`
-		LastUpdate      time.Time   `json:"last_update"`
-		SiteStatuses    []siteStatus `json:"site_statuses"`
-	}{
-		TotalSites: len(sites),
-		LastUpdate: time.Now(),
+	sites, err := h.dtuReceiver.GetSiteRepo().GetAll(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 
+	statuses := make([]map[string]interface{}, 0, len(sites))
 	for _, s := range sites {
-		sim, _ := h.simRepo.GetLatest(ctx, s.SiteID)
-		w, _ := h.weatherRepo.GetLatest(ctx, s.SiteID)
-		alarms, _ := h.alarmRepo.GetUnresolved(ctx, s.SiteID)
+		sim, _ := h.structuralSim.GetSimRepo().GetLatest(ctx, s.SiteID)
+		wa, _ := h.weatheringEval.GetWeatherRepo().GetLatest(ctx, s.SiteID)
+		alarms, _ := h.alarmMQTT.GetAlarmRepo().GetUnresolved(ctx, s.SiteID)
 
 		status := "HEALTHY"
-		level := 1
-		if w != nil {
-			switch w.WeatheringGrade {
-			case "SEVERE":
+		if sim != nil {
+			if sim.SafetyFactor < 1.0 {
 				status = "CRITICAL"
-				level = 4
-			case "SERIOUS":
-				status = "DANGER"
-				level = 3
-			case "MODERATE":
+			} else if sim.SafetyFactor < 1.2 {
 				status = "WARNING"
-				level = 2
 			}
 		}
-		if sim != nil && sim.SafetyFactor < 1.2 {
-			status = "CRITICAL"
-			level = 4
+		if wa != nil && (wa.WeatheringGrade == "SEVERE" || wa.WeatheringGrade == "SERIOUS") {
+			if status != "CRITICAL" {
+				status = "DANGER"
+			}
 		}
 		if len(alarms) > 0 {
 			for _, a := range alarms {
-				if a.AlarmLevel == "CRITICAL" {
-					status = "CRITICAL"
-					level = 4
-					dashboard.CriticalAlarms++
-					break
+				if a.Severity == 3 && status != "CRITICAL" {
+					status = "DANGER"
 				}
 			}
-			if level < 3 {
-				status = "WARNING"
-				level = 2
-			}
 		}
 
-		dashboard.ActiveAlarms += len(alarms)
-
-		st := siteStatus{
-			SiteID:           s.SiteID,
-			SiteName:         s.SiteName,
-			Region:           s.Region,
-			Status:           status,
-			StatusLevel:      level,
-			AlarmCount:       len(alarms),
-			SafetyFactor:     -1,
-			WeatheringGrade:  "",
-			PredictedLifespan: -1,
-		}
-		if sim != nil {
-			st.SafetyFactor = sim.SafetyFactor
-		}
-		if w != nil {
-			st.WeatheringGrade = w.WeatheringGrade
-			st.PredictedLifespan = w.RemainingLifespan
-		}
-		dashboard.SiteStatuses = append(dashboard.SiteStatuses, st)
+		statuses = append(statuses, map[string]interface{}{
+			"site_id":    s.SiteID,
+			"name":       s.SiteName,
+			"status":     status,
+			"simulation": sim,
+			"weathering": wa,
+			"alarms_cnt": len(alarms),
+			"updated_at": time.Now(),
+		})
 	}
 
-	ok(c, dashboard)
+	c.JSON(http.StatusOK, gin.H{
+		"sites":       statuses,
+		"module_metrics": map[string]interface{}{
+			"dtu_receiver":         h.dtuReceiver.GetMetrics(),
+			"structural_simulator": h.structuralSim.GetMetrics(),
+			"weathering_evaluator": h.weatheringEval.GetMetrics(),
+			"alarm_mqtt":           h.alarmMQTT.GetMetrics(),
+			"bus":                  h.bus.GetMetrics(),
+		},
+	})
 }
 
-type siteStatus struct {
-	SiteID           int     `json:"site_id"`
-	SiteName         string  `json:"site_name"`
-	Region           string  `json:"region"`
-	Status           string  `json:"status"`
-	StatusLevel      int     `json:"status_level"`
-	AlarmCount       int     `json:"alarm_count"`
-	SafetyFactor     float64 `json:"safety_factor"`
-	WeatheringGrade  string  `json:"weathering_grade"`
-	PredictedLifespan float64 `json:"predicted_lifespan_years"`
+func (h *Handler) GetDailySummary(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid site id"})
+		return
+	}
+	days, _ := strconv.Atoi(c.DefaultQuery("days", "7"))
+	ctx := c.Request.Context()
+
+	summary, err := h.dtuReceiver.GetSensorRepo().GetDailySummary(ctx, id, days)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, summary)
+}
+
+func (h *Handler) TriggerSimAll(c *gin.Context) {
+	go func() {
+		h.structuralSim.RunAll("api")
+	}()
+	c.JSON(http.StatusAccepted, gin.H{"status": "scheduled", "count": 10})
+}
+
+func (h *Handler) TriggerWeatheringAll(c *gin.Context) {
+	go func() {
+		h.weatheringEval.RunAll("api")
+	}()
+	c.JSON(http.StatusAccepted, gin.H{"status": "scheduled", "count": 10})
+}
+
+func (h *Handler) DTUReceiver() *dtu_receiver.DTUReceiver {
+	return h.dtuReceiver
+}
+
+func (h *Handler) StructuralSimulator() *structural_simulator.StructuralSimulator {
+	return h.structuralSim
+}
+
+func (h *Handler) WeatheringEvaluator() *weathering_evaluator.WeatheringEvaluator {
+	return h.weatheringEval
+}
+
+func (h *Handler) AlarmMQTT() *alarm_mqtt.AlarmMQTT {
+	return h.alarmMQTT
+}
+
+func (h *Handler) SiteNames() map[int]string {
+	return h.dtuReceiver.GetSiteNames()
 }
 
 func (h *Handler) checkMQTTAlarms() {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
-	published, err := h.mqttCli.ProcessPendingAlarms(ctx, h.siteNames)
-	if err != nil {
-		return
-	}
-	if published > 0 {
-	}
+	h.alarmMQTT.ProcessPendingAlarms(ctx)
 }

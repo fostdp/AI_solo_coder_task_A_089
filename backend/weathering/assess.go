@@ -165,7 +165,7 @@ func (a *Assessor) Assess(site *models.PlankroadSite, readings []models.SensorRe
 	}
 
 	ftDamage := calcFTDamage(rockParams, cycles, freezeStats)
-	shockDamage := calcThermalShock(rockParams, tempRange, tempTrans)
+	shockDamage := calcThermalShock(rockParams, tempRange, float64(tempTrans))
 	chemDamage := calcChemicalErosion(rockParams, avgTemp, avgHumid)
 
 	crackPropRate := a.calcCrackPropagation(rockParams, stressRange, avgCrack, cycles, ftDamage, shockDamage, chemDamage)

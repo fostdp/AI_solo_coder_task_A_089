@@ -260,6 +260,28 @@ type AlarmRepo struct{}
 
 func NewAlarmRepo() *AlarmRepo { return &AlarmRepo{} }
 
+func (r *AlarmRepo) Insert(ctx context.Context, a *models.AlarmEvent) error {
+	query := `
+		INSERT INTO alarm_events (
+			time, site_id, beam_id, alarm_type, alarm_level,
+			metric_name, current_value, threshold_value, description,
+			severity, acknowledged, resolved, mqtt_published
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+		RETURNING alarm_id
+	`
+	var id int64
+	err := database.Pool.QueryRow(ctx, query,
+		a.Time, a.SiteID, a.BeamID, a.AlarmType, a.AlarmLevel,
+		a.MetricName, a.CurrentValue, a.ThresholdValue, a.Description,
+		a.Severity, a.Acknowledged, a.Resolved, a.MQTTPublished,
+	).Scan(&id)
+	if err != nil {
+		return err
+	}
+	a.AlarmID = id
+	return nil
+}
+
 func (r *AlarmRepo) GetUnresolved(ctx context.Context, siteID int) ([]models.AlarmEvent, error) {
 	query := `
 		SELECT alarm_id, time, site_id, beam_id, alarm_type, alarm_level,

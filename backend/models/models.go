@@ -53,14 +53,26 @@ type StructuralSimulation struct {
 	MaxRockStress      float64         `json:"max_rock_stress" db:"max_rock_stress"`
 	MinRockStress      float64         `json:"min_rock_stress" db:"min_rock_stress"`
 	MaxDeflectionMM    float64         `json:"max_deflection_mm" db:"max_deflection_mm"`
+	MaxDisplacement    float64         `json:"max_displacement" db:"-"`
 	SafetyFactor       float64         `json:"safety_factor" db:"safety_factor"`
+	Iterations         int             `json:"iterations" db:"-"`
+	ResidualNorm       float64         `json:"residual_norm" db:"-"`
+	Converged          bool            `json:"converged" db:"-"`
+	ContactPairs       int             `json:"contact_pairs" db:"-"`
+	SlidingPairs       int             `json:"sliding_pairs" db:"-"`
+	SeparatedPairs     int             `json:"separated_pairs" db:"-"`
+	ComputeTimeMs      int64           `json:"compute_time_ms" db:"-"`
+	Nodes              []FEMNode       `json:"nodes,omitempty" db:"-"`
+	Elements           []FEMElement    `json:"elements,omitempty" db:"-"`
 	ElementData        json.RawMessage `json:"element_data,omitempty" db:"element_data"`
 	CreatedAt          time.Time       `json:"created_at,omitempty" db:"created_at"`
 }
 
 type FEMNode struct {
 	ID        int       `json:"id"`
-	X, Y, Z   float64   `json:"x,yz"`
+	X         float64   `json:"x"`
+	Y         float64   `json:"y"`
+	Z         float64   `json:"z"`
 	Material  string    `json:"material"`
 	StressXX  float64   `json:"stress_xx"`
 	StressYY  float64   `json:"stress_yy"`
@@ -108,6 +120,7 @@ type AlarmEvent struct {
 	CurrentValue   float64   `json:"current_value,omitempty" db:"current_value"`
 	ThresholdValue float64   `json:"threshold_value,omitempty" db:"threshold_value"`
 	Description    string    `json:"description" db:"description"`
+	Severity       int       `json:"severity,omitempty" db:"severity"`
 	Acknowledged   bool      `json:"acknowledged,omitempty" db:"acknowledged"`
 	Resolved       bool      `json:"resolved,omitempty" db:"resolved"`
 	MQTTPublished  bool      `json:"mqtt_published,omitempty" db:"mqtt_published"`

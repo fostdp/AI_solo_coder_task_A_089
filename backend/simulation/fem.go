@@ -1,4 +1,4 @@
-package fem
+package simulation
 
 import (
 	"encoding/json"
@@ -200,7 +200,7 @@ func (s *Solver) buildModel(site *models.PlankroadSite, wood, rock MaterialProps
 		}
 
 		rockStart := nodeID
-		rockNX := int(nx * 1.5)
+		rockNX := int(float64(nx) * 1.5)
 		for i := 0; i <= rockNX; i++ {
 			for j := 0; j <= ny+2; j++ {
 				for k := 0; k <= nzRock; k++ {
@@ -888,7 +888,16 @@ func (s *Solver) buildResult(site *models.PlankroadSite, model *FEAModel, readin
 		MaxRockStress:      round6(maxRockStress),
 		MinRockStress:      round6(minRockStress),
 		MaxDeflectionMM:    round6(maxDeflection),
+		MaxDisplacement:    round6(maxDeflection),
 		SafetyFactor:       round4(safetyFactor),
+		Iterations:         model.ConvergenceInfo.Iterations,
+		ResidualNorm:       model.ConvergenceInfo.ResidualNorm,
+		Converged:          model.ConvergenceInfo.Converged,
+		ContactPairs:       model.ConvergenceInfo.ContactCount,
+		SlidingPairs:       model.ConvergenceInfo.SlidingCount,
+		SeparatedPairs:     model.ConvergenceInfo.SeparatedCount,
+		Nodes:              sampleNodes(model.Nodes, 100),
+		Elements:           sampleElements(model.Elements, 200),
 		ElementData:        elemJSON,
 	}
 }
